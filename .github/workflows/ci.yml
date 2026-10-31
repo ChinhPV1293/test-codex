@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, UAT, main]
+  pull_request:
+    branches: [dev, UAT, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [dev, staging, prod]
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: testcodex_ci
+          MYSQL_USER: testcodex
+          MYSQL_PASSWORD: ci_app_password
+          MYSQL_ROOT_PASSWORD: ci_root_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="MYSQL_PWD=ci_app_password mysql --protocol=TCP -h 127.0.0.1 -u testcodex testcodex_ci -e 'SELECT 1'"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    env:
+      SPRING_PROFILES_ACTIVE: ${{ matrix.profile }}
+      DB_URL: jdbc:mysql://127.0.0.1:3306/testcodex_ci?allowPublicKeyRetrieval=true&sslMode=DISABLED
+      DB_USERNAME: testcodex
+      DB_PASSWORD: ci_app_password
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Build and integration tests with MySQL and Liquibase
+        run: bash ./mvnw --batch-mode --no-transfer-progress clean verify
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-${{ matrix.profile }}
+          path: target/surefire-reports/
+          retention-days: 7
+      - name: Upload application JAR
+        if: matrix.profile == 'dev'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-codex-${{ github.sha }}
+          path: target/test-codex-*.jar
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,136 @@
+name: Deploy to AWS EKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        required: true
+        options: [dev, staging, prod]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-eks-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: testcodex_ci
+          MYSQL_USER: testcodex
+          MYSQL_PASSWORD: ci_app_password
+          MYSQL_ROOT_PASSWORD: ci_root_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="MYSQL_PWD=ci_app_password mysql --protocol=TCP -h 127.0.0.1 -u testcodex testcodex_ci -e 'SELECT 1'"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - name: Check branch for target environment
+        env:
+          TARGET: ${{ inputs.environment }}
+        run: |
+          case "$TARGET" in
+            dev) expected=dev ;;
+            staging) expected=UAT ;;
+            prod) expected=main ;;
+            *) exit 1 ;;
+          esac
+          test "$GITHUB_REF" = "refs/heads/$expected"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Build and verify target profile with disposable MySQL
+        env:
+          SPRING_PROFILES_ACTIVE: ${{ inputs.environment }}
+          DB_URL: jdbc:mysql://127.0.0.1:3306/testcodex_ci?allowPublicKeyRetrieval=true&sslMode=DISABLED
+          DB_USERNAME: testcodex
+          DB_PASSWORD: ci_app_password
+        run: bash ./mvnw --batch-mode --no-transfer-progress clean verify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deploy-jar
+          path: target/test-codex-0.0.1-SNAPSHOT.jar
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    needs: build
+    environment: ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+      PROFILE: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate deployment settings
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          KUBECTL_VERSION: ${{ vars.KUBECTL_VERSION }}
+        run: |
+          : "${AWS_ROLE_ARN:?Set AWS_ROLE_ARN}"
+          : "${KUBECTL_VERSION:?Set KUBECTL_VERSION}"
+          : "${AWS_REGION:?Set AWS_REGION}"
+          : "${EKS_CLUSTER_NAME:?Set EKS_CLUSTER_NAME}"
+          : "${ECR_REPOSITORY:?Set ECR_REPOSITORY}"
+          : "${K8S_NAMESPACE:?Set K8S_NAMESPACE}"
+      - uses: actions/download-artifact@v4
+        with:
+          name: deploy-jar
+          path: target/
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          image="$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker build --tag "$image" .
+          docker push "$image"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: ${{ vars.KUBECTL_VERSION }}
+      - name: Configure EKS access
+        run: |
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER_NAME"
+          kubectl version --client
+          kubectl get namespace "$K8S_NAMESPACE"
+          kubectl -n "$K8S_NAMESPACE" get secret test-codex-db -o name
+      - name: Deploy and wait for rollout
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          manifest = Path('k8s/deployment.yaml').read_text()
+          for key in ('IMAGE', 'PROFILE'):
+              manifest = manifest.replace('${' + key + '}', os.environ[key])
+          Path('/tmp/deployment.yaml').write_text(manifest)
+          PY
+          kubectl -n "$K8S_NAMESPACE" apply -f /tmp/deployment.yaml -f k8s/service.yaml
+          kubectl -n "$K8S_NAMESPACE" rollout status deployment/test-codex --timeout=300s
